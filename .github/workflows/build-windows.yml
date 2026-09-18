@@ -1,0 +1,102 @@
+name: Build AC3 Windows x64 Static
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Reconstruct C++ sources
+        shell: pwsh
+        run: |
+          function Join-Base64Chunks([string]$pattern, [string]$gzPath, [string]$outPath) {
+            $chunks = Get-ChildItem $pattern | Sort-Object Name
+            if ($chunks.Count -eq 0) { throw "No chunks found: $pattern" }
+            $b64 = ""
+            foreach ($c in $chunks) { $b64 += (Get-Content $c.FullName -Raw).Trim() }
+            [IO.File]::WriteAllBytes($gzPath, [Convert]::FromBase64String($b64))
+            $input = [IO.File]::OpenRead($gzPath)
+            try {
+              $gzip = [IO.Compression.GzipStream]::new($input, [IO.Compression.CompressionMode]::Decompress)
+              try {
+                $output = [IO.File]::Create($outPath)
+                try { $gzip.CopyTo($output) } finally { $output.Dispose() }
+              } finally { $gzip.Dispose() }
+            } finally { $input.Dispose() }
+          }
+          Join-Base64Chunks "src_b64/alg_*.txt" "AC3_Algorithm.cpp.gz" "AC3_Algorithm.cpp"
+          Join-Base64Chunks "src_b64/test_*.txt" "AC3_Test.cpp.gz" "AC3_Test.cpp"
+          Write-Host "Algorithm bytes:" (Get-Item AC3_Algorithm.cpp).Length
+          Write-Host "Test bytes:" (Get-Item AC3_Test.cpp).Length
+
+      - name: Configure MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile static runtime EXEs
+        shell: cmd
+        run: |
+          cl /nologo /O2 /DNDEBUG /std:c++17 /EHsc /MT /utf-8 AC3_Algorithm.cpp /Fe:AC3_Algorithm.exe
+          if errorlevel 1 exit /b 1
+          cl /nologo /O2 /DNDEBUG /std:c++17 /EHsc /MT /utf-8 AC3_Test.cpp /Fe:AC3_Test.exe
+          if errorlevel 1 exit /b 1
+
+      - name: Run official regression
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force results | Out-Null
+          & .\AC3_Algorithm.exe .\config.json .\results
+          if ($LASTEXITCODE -ne 0) { throw "AC3_Algorithm.exe failed: $LASTEXITCODE" }
+          & .\AC3_Test.exe .\config.json .\results
+          if ($LASTEXITCODE -ne 0) { throw "AC3_Test.exe failed: $LASTEXITCODE" }
+          Get-Content .\results\metrics.txt
+          Get-Content .\results\evaluation.json
+
+      - name: Check dependencies
+        shell: cmd
+        run: |
+          dumpbin /dependents AC3_Algorithm.exe
+          dumpbin /dependents AC3_Test.exe
+
+      - name: Prepare final package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item AC3_Algorithm.exe dist\AC3_Algorithm.exe
+          Copy-Item AC3_Test.exe dist\AC3_Test.exe
+          Copy-Item config.json dist\参数配置.json
+          @"
+          AC3 v9 Windows x64 静态运行库版
+          
+          运行规划：
+            .\AC3_Algorithm.exe ".\参数配置.json" ".\results"
+          
+          独立测试：
+            .\AC3_Test.exe ".\参数配置.json" ".\results"
+          
+          关键安全指标：
+          - min_pairwise_m：全程任意两架无人机的实际最小中心间距
+          - required_pairwise_m：要求的最小机间距
+          - pairwise_margin_m：实际机间距安全裕量
+          - min_obstacle_clearance_m：无人机到障碍物表面的实际最小净空
+          - required_obstacle_clearance_m：要求的障碍净空
+          - obstacle_clearance_margin_m：障碍净空安全裕量
+          
+          测试完成后查看 results\evaluation.json。
+          "@ | Set-Content -Encoding UTF8 dist\使用说明.txt
+          Copy-Item results\metrics.txt dist\官方场景_metrics.txt
+          Copy-Item results\evaluation.json dist\官方场景_evaluation.json
+
+      - name: Upload Windows x64 static package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AC3-Windows-x64-static
+          path: dist
+          if-no-files-found: error
