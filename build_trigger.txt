@@ -1,0 +1,1 @@
+Trigger Windows x64 static build after workflow enabled on main.
